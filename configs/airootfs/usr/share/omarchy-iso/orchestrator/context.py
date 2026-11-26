@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .keyboard import validate_input_selection
+from .region import GLOBAL, resolve_region
 
 LANGUAGES = Path("/usr/share/omarchy/default/i18n/locales.json")
 
@@ -46,6 +47,7 @@ class InstallContext:
     # branding and agreement are for the owner a deferred install hands the
     # machine to, so no other install takes it.
     oem_dir: Path | None = None
+    region: str = GLOBAL
 
     target: Path = Path("/mnt")
     omarchy_path: Path = Path("/usr/share/omarchy")
@@ -78,6 +80,11 @@ class InstallContext:
 
         validate_input_selection(omarchy_install.get("input_method"), omarchy_install.get("input_xkb_layout", ""))
         validate_language(omarchy_install.get("language"))
+
+        # Resolved before any disk is touched, so an autoinstall naming a
+        # region this ISO lacks fails without wiping anything.
+        region = resolve_region(omarchy_install, user_configuration.get("timezone"))
+        omarchy_install["region"] = region
 
         # Deferred provisioning: the whole system installs but user creation is deferred to
         # first boot. Selected by the configurator (omarchy_install.defer_provisioning) or by
@@ -149,6 +156,7 @@ class InstallContext:
             omarchy_install=omarchy_install,
             defer_provisioning=defer_provisioning,
             oem_dir=_optional_path(os.environ.get("OMARCHY_INSTALL_OEM_DIR")) if defer_provisioning else None,
+            region=region,
             state_dir=state_dir,
         )
         disk_config = user_configuration.get("disk_config", {})
