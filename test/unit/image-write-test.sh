@@ -257,7 +257,11 @@ target "$work/target" 0
 run write "$disk/image.zst" "$work/target" 3
 [[ $status == 0 ]] || fail "partial-cache write for cache-drop check succeeds" "$(cat "$work/stderr")"
 read -r res tot < <(resident_pages "$disk/image.zst")
-((res <= 2)) || fail "partial-cache write drops consumed source pages" "got $res/$tot resident"
+# POSIX_FADV_DONTNEED uses folio_trylock and skips pages still locked by
+# in-flight POSIX_FADV_SEQUENTIAL async readahead on virtualized disks; require
+# at most 10% residency so a few in-flight readahead pages do not flake while
+# broken cache eviction still fails.
+((res * 10 <= tot)) || fail "partial-cache write drops consumed source pages" "got $res/$tot resident"
 pass "partial-cache write drops consumed source pages"
 
 cache all
@@ -484,7 +488,7 @@ decoding, writing, skipping, available = map(float, m.groups())
 assert decoding + writing + skipping <= available + 0.02, m.group(0)
 PY
   read -r res tot < <(resident_pages "$disk/image.sfs")
-  ((res <= 2)) || fail "write-squashfs with $state cached drops consumed pages" "got $res/$tot resident"
+  ((res * 10 <= tot)) || fail "write-squashfs with $state cached drops consumed pages" "got $res/$tot resident"
 done
 pass "cold and partial-cache write-squashfs reproduces stored/sparse blocks, reports progress, and drops cache"
 
