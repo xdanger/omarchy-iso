@@ -418,4 +418,54 @@ printf '%s\r\n' 'BdsDxe: starting Boot0005 "Limine" from HD(1,GPT,774175D2,0x800
 installed_system_started "$tmp/serial" || fail "the installed system's Limine starting is not noticed"
 if installed_system_started "$tmp/no-such-log"; then fail "a missing serial log counts as a started system"; fi
 
+
+# ------------------------------------------------------------ vm-seal autologin
+# vm-seal seals both edge (omarchy-system-login / greetd) and older stable
+# releases (4.5.0, SDDM without omarchy-system-login).
+seal_autologin=$(awk '
+  /^  if command -v omarchy-system-login / { in_block = 1 }
+  in_block { print; if (/^  fi$/) exit }
+' "$ROOT/test/vm-image/vm-seal")
+[[ $seal_autologin == *omarchy-system-login* && $seal_autologin == *autologin.conf* ]] ||
+  fail "could not extract vm-seal autologin block"
+
+run_seal_autologin() {
+  local mode=$1 dir="$tmp/seal-$1" body
+  mkdir -p "$dir/bin"
+  ln -sf "$(command -v install)" "$dir/bin/install"
+  case $mode in
+    greetd)
+      cat >"$dir/bin/omarchy-system-login" <<'STUB'
+#!/bin/bash
+printf '%s\n' "$*" >"$SEAL_LOG"
+STUB
+      chmod +x "$dir/bin/omarchy-system-login"
+      ;;
+    sddm)
+      printf '#!/bin/bash\nexit 0\n' >"$dir/bin/sddm"
+      chmod +x "$dir/bin/sddm"
+      ;;
+    none) ;;
+  esac
+  # Quote the rewritten path via SEAL_ROOT so TMPDIR values with spaces work,
+  # and keep PATH strictly to $dir/bin so real host binaries never leak in.
+  # shellcheck disable=SC2016 # $SEAL_ROOT expands inside the subshell below
+  body=${seal_autologin//\/etc\/sddm.conf.d\/autologin.conf/'"$SEAL_ROOT/etc/sddm.conf.d/autologin.conf"'}
+  # shellcheck disable=SC2016 # $SEAL_ROOT expands inside the subshell below
+  body=${body//install -d \/etc\/sddm.conf.d/'install -d "$SEAL_ROOT/etc/sddm.conf.d"'}
+  env -i PATH="$dir/bin" SEAL_ROOT="$dir" SEAL_LOG="$dir/calls" "$BASH" -ec "$body"
+}
+
+run_seal_autologin greetd || fail "vm-seal autologin failed with omarchy-system-login"
+equal "vm-seal uses omarchy-system-login when present" "$(cat "$tmp/seal-greetd/calls")" "omarchy --autologin"
+
+run_seal_autologin sddm || fail "vm-seal autologin failed on SDDM release without omarchy-system-login"
+equal "vm-seal writes SDDM autologin.conf when omarchy-system-login is absent" \
+  "$(tr '\n' '|' <"$tmp/seal-sddm/etc/sddm.conf.d/autologin.conf")" \
+  "[Autologin]|User=omarchy|Session=omarchy.desktop|"
+
+refused "vm-seal fails when neither omarchy-system-login nor sddm exists" run_seal_autologin none
+grep -Fxq "vm-seal: neither omarchy-system-login nor sddm found" "$tmp/refused.err" ||
+  fail "vm-seal missing-login diagnostic mismatch: $(cat "$tmp/refused.err")"
+
 echo "nightly tests passed"
