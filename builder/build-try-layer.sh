@@ -267,11 +267,12 @@ EOF
 ln -s no-wait.d/50-omarchy-try-timezone "$merged/etc/NetworkManager/dispatcher.d/50-omarchy-try-timezone"
 
 # Devices the live installer ran without what they need: no radio firmware,
-# no SOF audio. omarchy-try lets them go before its soft reboot, which keeps
-# the kernel's drivers, and udev's coldplug replays uevents without probing a
-# loaded driver again. Once udev has loaded what it loads, probe every PCI and
-# USB device that still has no driver, with the session's firmware and
-# modprobe settings in place (builder/try-layer/).
+# no SOF audio, live-only modprobe blacklists. omarchy-try lets wireless and
+# audio controllers go before its soft reboot, which keeps the kernel's drivers
+# and leaves systemd-udev-trigger.service active (exited), so udev coldplug
+# does not run again. Load unblacklisted modules and probe every PCI, USB, and
+# platform audio/video device that still has no driver, with the session's
+# firmware and modprobe settings in place (builder/try-layer/).
 install -Dm755 "$scripts/omarchy-try-reprobe" "$merged/usr/local/lib/omarchy-try/omarchy-try-reprobe"
 install -Dm644 /dev/stdin "$merged/etc/systemd/system/omarchy-try-reprobe.service" <<'EOF'
 [Unit]

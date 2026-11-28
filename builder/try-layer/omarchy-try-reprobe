@@ -1,37 +1,55 @@
 #!/bin/bash
 #
-# Try Omarchy: probe again every PCI, USB, and platform audio device that has
-# no driver. omarchy-try-reprobe.service runs it once, early in a Try session.
+# Try Omarchy: load drivers and probe every PCI, USB, and platform audio/video
+# device that has no driver. omarchy-try-reprobe.service runs it once, early in
+# a Try session.
 #
-# Try starts from the live installer by a soft reboot, which keeps the
-# kernel's drivers. The live system runs some devices without what they need
-# (no radio firmware, no SOF audio, no Qualcomm ASoC topology firmware), and
-# omarchy-try lets PCI controllers go before the soft reboot; a Wi-Fi or
-# platform ASoC sound card driver may have released its device already. udev's
-# coldplug in the session replays uevents without probing a driver that is
-# already loaded, so without this those devices stay without one: no Wi-Fi,
-# no sound. Written to drivers_probe, a device is matched again against every
-# driver loaded now, with the session's firmware and modprobe settings.
+# Try starts from the live installer by a soft reboot, which keeps the kernel's
+# drivers and leaves systemd-udev-trigger.service active (exited) from the live
+# boot, so udev coldplug does not run again after the soft reboot. Any module
+# blacklisted only in the live installer (such as Intel SOF audio in
+# blacklist-panther-lake-audio.conf, USB Bluetooth in blacklist-bluetooth.conf,
+# or qcom_iris in blacklist-qcom-iris.conf) is therefore never loaded by udev,
+# and writing to drivers_probe only matches drivers already loaded.
+#
+# For each unbound device below, load its modalias with `modprobe -qb` (which
+# honours the Try session's modprobe.d blacklists) before falling back to
+# drivers_probe for drivers already loaded (for example a controller omarchy-try
+# unbound before the soft reboot).
 
 sysfs=${OMARCHY_SYSFS:-/sys}
 
+reprobe_device() {
+  local device=$1 bus=${1%/devices/*} modalias=${2-}
+  [[ -e $device && ! -e $device/driver ]] || return 0
+  if [[ -z $modalias && -r $device/modalias ]]; then
+    read -r modalias <"$device/modalias" || modalias=""
+  fi
+  if [[ -n $modalias ]]; then
+    modprobe -qb "$modalias" 2>/dev/null || true
+  fi
+  if [[ ! -e $device/driver ]]; then
+    { printf '%s' "${device##*/}" >"$bus/drivers_probe"; } 2>/dev/null || true
+  fi
+}
+
 for device in "$sysfs"/bus/pci/devices/* "$sysfs"/bus/usb/devices/*; do
-  [[ -e $device && ! -e $device/driver ]] || continue
-  printf '%s' "${device##*/}" >"${device%/devices/*}/drivers_probe" 2>/dev/null || true
+  reprobe_device "$device"
 done
 
-# Snapdragon laptops expose audio as a Device Tree platform device (e.g.
-# "sound" with modalias of:Nsound...Cqcom,x1e80100-sndcard), not a PCI audio
-# controller. Re-probe only unbound platform sound devices so unrelated
-# platform devices (such as blacklisted remoteprocs) are left untouched.
+# Snapdragon laptops expose audio and video codecs as Device Tree platform
+# devices (for example "sound" with modalias of:Nsound...Cqcom,x1e80100-sndcard
+# or qcom_iris video-codec), not PCI controllers. Re-probe only unbound
+# platform sound and video-codec devices so unrelated platform devices (such as
+# blacklisted remoteprocs or FM radios) are left untouched.
 for device in "$sysfs"/bus/platform/devices/*; do
   [[ -e $device && ! -e $device/driver ]] || continue
   name=${device##*/}
   modalias=""
   [[ -r $device/modalias ]] && read -r modalias <"$device/modalias" || true
   case "$name|$modalias" in
-    sound\|*|*sndcard*|*sound*)
-      printf '%s' "$name" >"$sysfs/bus/platform/drivers_probe" 2>/dev/null || true
+    *sndcard*|*sound*|*video-codec*)
+      reprobe_device "$device" "$modalias"
       ;;
   esac
 done
