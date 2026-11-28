@@ -21,11 +21,101 @@ folder() {
   true
 }
 
+# Shared exact decimal reader and formatter (half-away-from-zero to tenths) so
+# summary cells, summary deltas, and phase rows agree on every boundary input
+# and untrusted timing JSON never passes through shell delimiters.
+py_timing() {
+  python3 - "$@" <<'PY'
+import json
+import re
+import sys
+from decimal import Decimal, ROUND_HALF_UP
+
+Q = Decimal("0.1")
+
+
+def fmt_cell(val: Decimal | None) -> str:
+    if val is None:
+        return "–"
+    v = val.quantize(Q, rounding=ROUND_HALF_UP)
+    if v == 0:
+        v = Decimal("0.0")
+    return f"{v:.1f} s"
+
+
+def fmt_delta(this: Decimal | None, was: Decimal | None, thresh: Decimal) -> str:
+    if this is None or was is None:
+        return "–"
+    d = (this - was).quantize(Q, rounding=ROUND_HALF_UP)
+    if d == 0:
+        d = Decimal("0.0")
+    s = f"{'+' if d >= 0 else '−'}{abs(d):.1f} s"
+    if d >= thresh:
+        return f"🔴 **{s}**"
+    if d <= -thresh:
+        return f"🟢 {s}"
+    return s
+
+
+def load_json(path: str):
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh, parse_float=Decimal, parse_int=Decimal)
+
+
+def require_num(val, *, allow_none: bool = False) -> Decimal | None:
+    if val is None and allow_none:
+        return None
+    if not isinstance(val, Decimal) or not val.is_finite():
+        raise ValueError(f"expected finite number, got {type(val).__name__}")
+    return val
+
+
+mode = sys.argv[1]
+if mode == "cell":
+    print(fmt_cell(Decimal(sys.argv[2])))
+elif mode == "delta":
+    print(fmt_delta(Decimal(sys.argv[2]), Decimal(sys.argv[3]), Decimal(sys.argv[4])))
+elif mode == "install":
+    try:
+        data = load_json(sys.argv[2])
+        if isinstance(data, dict):
+            s = require_num(data.get("started_at"))
+            e = require_num(data.get("finished_at"))
+            print(e - s)
+    except (OSError, ValueError):
+        pass
+elif mode == "phases":
+    pt_path, bt_path = sys.argv[2], sys.argv[3]
+    pr_data = load_json(pt_path)
+    if not isinstance(pr_data, dict) or not isinstance(pr_data.get("phases"), list):
+        raise ValueError("timing JSON missing phases list")
+    base_map: dict[str, Decimal | None] = {}
+    if bt_path:
+        base_data = load_json(bt_path)
+        if not isinstance(base_data, dict) or not isinstance(base_data.get("phases"), list):
+            raise ValueError("baseline timing JSON missing phases list")
+        for item in base_data["phases"]:
+            if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                raise ValueError("invalid baseline phase entry")
+            base_map[item["name"]] = require_num(item.get("elapsed"), allow_none=True)
+    thresh = Decimal("0.5")
+    for item in pr_data["phases"]:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            raise ValueError("invalid phase entry")
+        raw_name = item["name"]
+        # Phase names come from the pull request's installer: keep them to plain text.
+        name = re.sub(r"[^A-Za-z0-9 +&/().-]", "", raw_name)[:60]
+        this = require_num(item.get("elapsed"), allow_none=True)
+        was = base_map.get(raw_name)
+        print(f"| {name} | {fmt_cell(this)} | {fmt_cell(was)} | {fmt_delta(this, was, thresh)} |")
+PY
+}
+
 # Every lookup prints nothing rather than failing, so a missing number (no
 # baseline yet, or a test that stopped early) shows as "–".
 first() { [[ -n $1 ]] || return 0; { find "$1" -path "$2" 2>/dev/null || true; } | sort | head -1; }
 build_s() { local f; f=$(first "$1" '*/build-seconds'); [[ -z $f ]] || tr -dc 0-9. <"$f"; }
-install_s() { local f; f=$(first "$1" '*/omarchy-install-timing.json'); [[ -z $f ]] || jq -r '.finished_at - .started_at' "$f" 2>/dev/null || true; }
+install_s() { local f; f=$(first "$1" '*/omarchy-install-timing.json'); [[ -z $f ]] || py_timing install "$f"; }
 # "Startup finished in 2s (firmware) + 9s (loader) + 1min 3.2s (userspace) = …"
 # -> seconds, without the firmware's share: it is the VM's, and in the aarch64
 # VM it reads as the runner's uptime, minutes long.
@@ -38,11 +128,8 @@ boot_s() {
 }
 first_boot_s() { boot_s "$1" '*/first-boot-systemd-analyze.txt'; }
 everyday_boot_s() { boot_s "$1" '*-boot/systemd-analyze.txt'; }
-cell() { [[ -n $1 ]] && awk -v x="$1" 'BEGIN{printf "%.1f s", x}' || echo "–"; }
-change() {
-  [[ -n $1 && -n $2 ]] || { echo "–"; return; }
-  awk -v a="$1" -v b="$2" 'BEGIN{d=a-b; printf "%s%.1f s", (d>=0?"+":"−"), (d<0?-d:d)}'
-}
+cell() { [[ -n $1 ]] && py_timing cell "$1" || echo "–"; }
+change() { [[ -n $1 && -n $2 ]] && py_timing delta "$1" "$2" "$3" || echo "–"; }
 result() {
   case $(cat "$1/status" 2>/dev/null || true) in
   success) echo "✅ passed" ;; "") echo "–" ;; *) echo "❌ $(cat "$1/status")" ;;
@@ -61,11 +148,16 @@ for arch in "${arches[@]}"; do
   head+=" \`$arch\` | vs quattro |" rule+=" ---: | ---: |" results+=" $(result "$(folder "$arch" "$pr")") | |"
 done
 printf '%s\n' "$head" "$rule" "$results"
-for row in "Build the ISO|build_s" "Install|install_s" "First boot|first_boot_s" "Everyday boot|everyday_boot_s"; do
-  line="| ${row%|*} |"
+for row in \
+  "Build the ISO|build_s|10.0" \
+  "Install|install_s|1.0" \
+  "First boot|first_boot_s|0.5" \
+  "Everyday boot|everyday_boot_s|0.5"; do
+  IFS='|' read -r label fn thresh <<<"$row"
+  line="| $label |"
   for arch in "${arches[@]}"; do
-    this=$("${row#*|}" "$(folder "$arch" "$pr")") was=$("${row#*|}" "$(folder "$arch" "$base")")
-    line+=" $(cell "$this") | $(change "$this" "$was") |"
+    this=$("$fn" "$(folder "$arch" "$pr")") was=$("$fn" "$(folder "$arch" "$base")")
+    line+=" $(cell "$this") | $(change "$this" "$was" "$thresh") |"
   done
   echo "$line"
 done
@@ -74,18 +166,14 @@ echo "Boots are loader, kernel and userspace, without the VM's firmware."
 for arch in "${arches[@]}"; do
   pt=$(first "$(folder "$arch" "$pr")" '*/omarchy-install-timing.json')
   bt=$(first "$(folder "$arch" "$base")" '*/omarchy-install-timing.json')
-  [[ -n $pt ]] || continue
+  [[ -s $pt ]] || continue
+  [[ -s $bt ]] || bt=""
   echo
   echo "<details><summary>Install phases, $arch</summary>"
   echo
-  echo "| Phase | This PR | quattro |"
-  echo "| --- | ---: | ---: |"
-  # Phase names come from the pull request's installer: keep them to plain text.
-  jq -r --slurpfile b <([[ -n $bt ]] && cat "$bt" || echo '{"phases":[]}') '
-    ($b[0].phases | map({key: .name, value: .elapsed}) | from_entries) as $base
-    | .phases[]
-    | "| \(.name | gsub("[^A-Za-z0-9 +&/().-]"; "") | .[0:60]) | \(.elapsed * 10 | round / 10) s | \(($base[.name] // null) | if . == null then "–" else "\(. * 10 | round / 10) s" end) |"
-  ' "$pt"
+  echo "| Phase | This PR | quattro | vs quattro |"
+  echo "| --- | ---: | ---: | ---: |"
+  py_timing phases "$pt" "$bt"
   echo
   echo "</details>"
 done
