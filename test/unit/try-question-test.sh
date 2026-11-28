@@ -382,7 +382,8 @@ mkdir -p "$sys/bus/pci/devices/0000:00:02.0/driver" "$sys/bus/pci/devices/0000:0
   "$sys/bus/usb/devices/1-2:1.0/driver"
 : >"$sys/bus/pci/drivers_probe"
 : >"$sys/bus/usb/drivers_probe"
-OMARCHY_SYSFS=$sys bash "$LAYER_SCRIPTS/omarchy-try-reprobe" || fail "omarchy-try-reprobe failed"
+mkdir -p "$work/reprobe-noop-bin" && printf '#!/bin/bash\nexit 0\n' >"$work/reprobe-noop-bin/modprobe" && chmod +x "$work/reprobe-noop-bin/modprobe"
+PATH="$work/reprobe-noop-bin:$PATH" OMARCHY_SYSFS=$sys bash "$LAYER_SCRIPTS/omarchy-try-reprobe" || fail "omarchy-try-reprobe failed"
 [[ $(<"$sys/bus/pci/drivers_probe") == "0000:00:14.3" ]] || fail "the driverless PCI device was not probed: '$(<"$sys/bus/pci/drivers_probe")'"
 [[ ! -s $sys/bus/usb/drivers_probe ]] || fail "a USB interface with a driver was probed again"
 pass "the reprobe writes each driverless device, and only those, to its bus"
@@ -771,10 +772,71 @@ printf 'of:NremoteprocT(null)Cqcom,x1e80100-adsp-pas\n' >"$reprobe_sys/bus/platf
 : >"$reprobe_sys/bus/pci/drivers_probe"
 : >"$reprobe_sys/bus/usb/drivers_probe"
 : >"$reprobe_sys/bus/platform/drivers_probe"
-OMARCHY_SYSFS="$reprobe_sys" bash "$LAYER_SCRIPTS/omarchy-try-reprobe" || fail "omarchy-try-reprobe failed"
+PATH="$work/reprobe-noop-bin:$PATH" OMARCHY_SYSFS="$reprobe_sys" bash "$LAYER_SCRIPTS/omarchy-try-reprobe" || fail "omarchy-try-reprobe failed"
 [[ $(<"$reprobe_sys/bus/platform/drivers_probe") == "sound" ]] || fail "platform sound device was not reprobed: $(cat "$reprobe_sys/bus/platform/drivers_probe")"
 rm -rf "$reprobe_sys/bus/platform/devices/sound"
 : >"$reprobe_sys/bus/platform/drivers_probe"
-OMARCHY_SYSFS="$reprobe_sys" bash "$LAYER_SCRIPTS/omarchy-try-reprobe" || fail "omarchy-try-reprobe failed without sound device"
+PATH="$work/reprobe-noop-bin:$PATH" OMARCHY_SYSFS="$reprobe_sys" bash "$LAYER_SCRIPTS/omarchy-try-reprobe" || fail "omarchy-try-reprobe failed without sound device"
 [[ ! -s "$reprobe_sys/bus/platform/drivers_probe" ]] || fail "reprobe must not probe bound or non-audio platform devices: $(cat "$reprobe_sys/bus/platform/drivers_probe")"
 echo "ok - omarchy-try-reprobe probes unbound Snapdragon platform sound devices only"
+
+# Unbound PCI, USB, and platform audio/video devices whose drivers were
+# blacklisted only in the live installer (e.g. Intel SOF audio, USB Bluetooth,
+# qcom_iris) are loaded via `modprobe -qb` before falling back to drivers_probe.
+reprobe_mod="$work/sys-modprobe"
+mkdir -p \
+  "$reprobe_mod/bus/pci/devices/0000:00:1f.3" \
+  "$reprobe_mod/bus/pci/devices/0000:00:14.3" \
+  "$reprobe_mod/bus/pci/devices/0000:00:02.0/driver" \
+  "$reprobe_mod/bus/usb/devices/1-2:1.0" \
+  "$reprobe_mod/bus/platform/devices/sound" \
+  "$reprobe_mod/bus/platform/devices/aa00000.video-codec" \
+  "$reprobe_mod/bus/platform/devices/30000000.remoteproc" \
+  "$work/reprobe-mod-bin"
+echo "pci:v00008086d0000E428sv00001028sd00000DBAbc04sc03i80" >"$reprobe_mod/bus/pci/devices/0000:00:1f.3/modalias"
+echo "pci:v00008086d00002725sv00008086sd00000024bc02sc80i00" >"$reprobe_mod/bus/pci/devices/0000:00:14.3/modalias"
+echo "pci:v00008086d0000E400sv00001028sd00000DBAbc03sc00i00" >"$reprobe_mod/bus/pci/devices/0000:00:02.0/modalias"
+echo "usb:v8087p0033d0000dcE0dsc01dp01icE0isc01ip01in00" >"$reprobe_mod/bus/usb/devices/1-2:1.0/modalias"
+echo "of:NsoundT(null)Cqcom,x1e80100-sndcard" >"$reprobe_mod/bus/platform/devices/sound/modalias"
+echo "of:Nvideo-codecT(null)Cqcom,x1e80100-irisCqcom,sm8550-iris" >"$reprobe_mod/bus/platform/devices/aa00000.video-codec/modalias"
+echo "of:NremoteprocT(null)Cqcom,x1e80100-pas" >"$reprobe_mod/bus/platform/devices/30000000.remoteproc/modalias"
+: >"$reprobe_mod/bus/pci/drivers_probe"
+: >"$reprobe_mod/bus/usb/drivers_probe"
+: >"$reprobe_mod/bus/platform/drivers_probe"
+: >"$work/reprobe-mod-calls"
+cat >"$work/reprobe-mod-bin/modprobe" <<'MOCK'
+#!/bin/bash
+printf '%s\n' "$*" >>"$REPROBE_MOD_LOG"
+# Simulate snd_sof_pci_intel_ptl binding 0000:00:1f.3 on load; 0000:00:14.3 stays
+# unbound so drivers_probe must still run for it.
+if [[ $* == *v00008086d0000E428* ]]; then
+  mkdir -p "$OMARCHY_SYSFS/bus/pci/devices/0000:00:1f.3/driver"
+fi
+MOCK
+chmod +x "$work/reprobe-mod-bin/modprobe"
+REPROBE_MOD_LOG="$work/reprobe-mod-calls" PATH="$work/reprobe-mod-bin:$PATH" OMARCHY_SYSFS=$reprobe_mod \
+  bash "$LAYER_SCRIPTS/omarchy-try-reprobe" || fail "omarchy-try-reprobe with modprobe failed"
+grep -Fxq -- "-qb pci:v00008086d0000E428sv00001028sd00000DBAbc04sc03i80" "$work/reprobe-mod-calls" ||
+  fail "SOF PCI audio modalias not loaded: $(cat "$work/reprobe-mod-calls")"
+grep -Fxq -- "-qb usb:v8087p0033d0000dcE0dsc01dp01icE0isc01ip01in00" "$work/reprobe-mod-calls" ||
+  fail "USB Bluetooth modalias not loaded: $(cat "$work/reprobe-mod-calls")"
+grep -Fxq -- "-qb of:NsoundT(null)Cqcom,x1e80100-sndcard" "$work/reprobe-mod-calls" ||
+  fail "platform sound modalias not loaded: $(cat "$work/reprobe-mod-calls")"
+grep -Fxq -- "-qb of:Nvideo-codecT(null)Cqcom,x1e80100-irisCqcom,sm8550-iris" "$work/reprobe-mod-calls" ||
+  fail "platform video-codec modalias not loaded: $(cat "$work/reprobe-mod-calls")"
+grep -Fq "0000E400" "$work/reprobe-mod-calls" && fail "already-bound PCI device was modprobed"
+grep -Fq "remoteproc" "$work/reprobe-mod-calls" && fail "unrelated remoteproc platform device was modprobed"
+[[ $(<"$reprobe_mod/bus/pci/drivers_probe") == "0000:00:14.3" ]] ||
+  fail "drivers_probe should receive only the still-unbound PCI device: '$(<"$reprobe_mod/bus/pci/drivers_probe")'"
+[[ $(<"$reprobe_mod/bus/usb/drivers_probe") == "1-2:1.0" ]] ||
+  fail "drivers_probe should receive the still-unbound USB device: '$(<"$reprobe_mod/bus/usb/drivers_probe")'"
+# Test remoteproc in isolation so earlier writes cannot mask a spurious probe.
+rm -rf "$reprobe_mod/bus/platform/devices/sound" "$reprobe_mod/bus/platform/devices/aa00000.video-codec"
+: >"$reprobe_mod/bus/platform/drivers_probe"
+: >"$work/reprobe-mod-calls"
+REPROBE_MOD_LOG="$work/reprobe-mod-calls" PATH="$work/reprobe-mod-bin:$PATH" OMARCHY_SYSFS=$reprobe_mod \
+  bash "$LAYER_SCRIPTS/omarchy-try-reprobe" || fail "omarchy-try-reprobe remoteproc isolation check failed"
+[[ ! -s "$reprobe_mod/bus/platform/drivers_probe" ]] ||
+  fail "unrelated remoteproc platform device was probed: $(cat "$reprobe_mod/bus/platform/drivers_probe")"
+grep -Fq "remoteproc" "$work/reprobe-mod-calls" && fail "unrelated remoteproc platform device was modprobed"
+pass "omarchy-try-reprobe loads live-blacklisted PCI, USB, and platform audio/video drivers via modprobe -qb"
